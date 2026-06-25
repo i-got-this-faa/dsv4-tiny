@@ -1,0 +1,61 @@
+# DSV4-Tiny Configuration
+# Derived from Qwen3.5-0.8B + DSv4 compression hyperparameters
+
+# Base architecture (from Qwen3.5-0.8B)
+hidden_size: 1024
+num_hidden_layers: 24
+num_attention_heads: 8
+num_key_value_heads: 2
+head_dim: 256
+intermediate_size: 3584
+vocab_size: 248320
+max_position_embeddings: 262144
+rms_norm_eps: 1.0e-6
+rope_theta: 10000000.0
+partial_rotary_factor: 0.25
+attn_output_gate: true
+tie_word_embeddings: true
+mtp_num_hidden_layers: 1
+
+# DSv4 compression
+csa_block_size: 4
+csa_compressed_dim: 256
+csa_intermediate: 512
+csa_groups: 4
+csa_group_dim: 512
+
+hca_block_size: 128
+hca_compressed_dim: 512
+
+swa_window_size: 128
+
+indexer_heads: 8
+indexer_dim: 128
+indexer_top_k: 128
+
+block_alignment: 128  # lcm(4, 128)
+rope_dim: 64
+
+# Training
+lr_warmup: 1.0e-4
+lr_warmup_end: 1.0e-6
+lr_finetune: 2.0e-4
+weight_decay: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.95
+adam_eps: 1.0e-8
+
+# LoRA
+lora_r: 16
+lora_alpha: 16
+lora_dropout: 0.0
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# Quantization
+load_in_4bit: true
+bnb_4bit_compute_dtype: bfloat16
+bnb_4bit_quant_type: nf4

@@ -1,0 +1,27 @@
+[project]
+name = "dsv4-tiny"
+version = "0.1.0"
+description = "DeepSeek-V4 three-tier heterogeneous KV cache (CSA + HCA + SWA) as a ~0.8B transformer"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "accelerate>=1.14.0",
+    "datasets>=4.3.0",
+    "ninja>=1.13.0",
+    "peft>=0.19.1",
+    "protobuf>=7.35.1",
+    "sentencepiece>=0.2.1",
+    "tensorboard>=2.20.0",
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "transformers>=5.5.0",
+    "trl>=0.24.0",
+    "unsloth>=2026.6.9",
+]
+
+[project.scripts]
+dsv4-train-warm = "scripts.warm_start:main"
+dsv4-train-lora = "scripts.finetune_lora:main"
+dsv4-serve = "src.dsv4_tiny.inference:main"
+dsv4-benchmark = "src.dsv4_tiny.benchmark:main"
