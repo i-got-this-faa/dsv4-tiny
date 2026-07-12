@@ -1,4 +1,4 @@
-"""Tests for CSACompressor and HCACompressor."""
+"""Tests for LatentMemoryEncoder and LatentMemoryDecoder."""
 
 import sys
 from pathlib import Path
@@ -7,74 +7,75 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import torch
 
 from dsv4_tiny.config import DSV4TinyConfig
-from dsv4_tiny.compression import CSACompressor, HCACompressor
+from dsv4_tiny.compression import LatentMemoryEncoder, LatentMemoryDecoder
 
 
-def test_csa_compressor_output_shape():
+def test_latent_encoder_output_shape():
     cfg = DSV4TinyConfig()
-    compressor = CSACompressor(cfg)
-    b, m, d = 2, cfg.csa_block_size, cfg.hidden_size
-    hidden = torch.randn(b, m, d)
-    block_mask = torch.ones(b, m, dtype=torch.bool)
+    b, chunk_size, d = 2, cfg.block_alignment, cfg.hidden_size
+    encoder = LatentMemoryEncoder(
+        hidden_size=d,
+        num_slots=cfg.latent_slots_per_chunk,
+        latent_size=cfg.latent_memory_size,
+        encoder_hidden=cfg.encoder_hidden,
+        chunk_size=chunk_size,
+    )
+    hidden = torch.randn(b, chunk_size, d)
+    latents = encoder(hidden)
+    assert latents.shape == (b, cfg.latent_slots_per_chunk, cfg.latent_memory_size), \
+        f"Expected ({b}, {cfg.latent_slots_per_chunk}, {cfg.latent_memory_size}), got {latents.shape}"
 
-    c_comp = compressor(hidden, block_mask)
-    expected_dim = cfg.csa_compressed_dim * cfg.csa_groups + cfg.csa_intermediate
-    assert c_comp.shape == (b, expected_dim), f"Expected ({b}, {expected_dim}), got {c_comp.shape}"
 
-
-def test_csa_first_block_boundary():
+def test_latent_decoder_output_shape():
     cfg = DSV4TinyConfig()
-    compressor = CSACompressor(cfg)
-    b, m, d = 1, cfg.csa_block_size, cfg.hidden_size
-    hidden = torch.randn(b, m, d)
-    block_mask = torch.ones(b, m, dtype=torch.bool)
+    decoder = LatentMemoryDecoder(
+        latent_size=cfg.latent_memory_size,
+        head_dim=cfg.head_dim,
+    )
+    b = 2
+    latent = torch.randn(b, cfg.latent_memory_size)
+    k, v, confidence, recon = decoder(latent)
+    assert k.shape == (b, cfg.head_dim), f"Expected ({b}, {cfg.head_dim}), got {k.shape}"
+    assert v.shape == (b, cfg.head_dim)
+    assert confidence.shape == (b, 1)
+    assert recon.shape == (b, cfg.block_alignment * cfg.hidden_size), \
+        f"Expected ({b}, {cfg.block_alignment * cfg.hidden_size}), got {recon.shape}"
 
-    # First block: should use only Ca stream
-    c_first = compressor(hidden, block_mask, first_block=True)
-    c_normal = compressor(hidden, block_mask, first_block=False)
 
-    # Both should succeed with the same shape
-    expected_dim = cfg.csa_compressed_dim * cfg.csa_groups + cfg.csa_intermediate
-    assert c_first.shape == (b, expected_dim)
-    assert c_normal.shape == (b, expected_dim)
-
-
-def test_csa_block_mask():
+def test_latent_gradient_flow():
     cfg = DSV4TinyConfig()
-    compressor = CSACompressor(cfg)
-    b, m, d = 1, cfg.csa_block_size, cfg.hidden_size
-    hidden = torch.randn(b, m, d)
-
-    # Partial block (only 3 of 4 tokens valid)
-    block_mask = torch.tensor([[True, True, True, False]])
-    c_comp = compressor(hidden, block_mask)
-    expected_dim = cfg.csa_compressed_dim * cfg.csa_groups + cfg.csa_intermediate
-    assert c_comp.shape == (b, expected_dim)
-
-
-def test_hca_compressor_output_shape():
-    cfg = DSV4TinyConfig()
-    compressor = HCACompressor(cfg)
-    b, m, d = 2, cfg.hca_block_size, cfg.hidden_size
-    hidden = torch.randn(b, m, d)
-    block_mask = torch.ones(b, m, dtype=torch.bool)
-
-    c_comp = compressor(hidden, block_mask)
-    expected_dim = cfg.hca_compressed_dim
-    assert c_comp.shape == (b, expected_dim), f"Expected ({b}, {expected_dim}), got {c_comp.shape}"
-
-
-def test_compressor_gradient_flow():
-    cfg = DSV4TinyConfig()
-    compressor = CSACompressor(cfg)
-    b, m, d = 1, cfg.csa_block_size, cfg.hidden_size
-    hidden = torch.randn(b, m, d, requires_grad=True)
-    block_mask = torch.ones(b, m, dtype=torch.bool)
-
-    c_comp = compressor(hidden, block_mask)
-    loss = c_comp.sum()
+    b, chunk_size, d = 1, cfg.block_alignment, cfg.hidden_size
+    encoder = LatentMemoryEncoder(
+        hidden_size=d,
+        num_slots=cfg.latent_slots_per_chunk,
+        latent_size=cfg.latent_memory_size,
+        encoder_hidden=cfg.encoder_hidden,
+        chunk_size=chunk_size,
+    )
+    decoder = LatentMemoryDecoder(
+        latent_size=cfg.latent_memory_size,
+        head_dim=cfg.head_dim,
+    )
+    hidden = torch.randn(b, chunk_size, d, requires_grad=True)
+    latents = encoder(hidden)
+    latent = latents.mean(dim=1)  # pool slots
+    k, v, confidence, recon = decoder(latent)
+    loss = (k.mean() + v.mean() + recon.mean())
     loss.backward()
 
-    assert compressor.W_aKV.weight.grad is not None
-    assert compressor.W_aZ.weight.grad is not None
-    assert compressor.Ba.grad is not None
+    assert encoder.token_proj.weight.grad is not None, "Encoder token_proj should get gradients"
+    assert decoder.proj.weight.grad is not None, "Decoder proj should get gradients"
+    assert decoder.reconstruct.weight.grad is not None, "Decoder reconstruct should get gradients"
+
+def test_encoder_confidence_range():
+    """Confidence should be in (0, 1) after sigmoid."""
+    cfg = DSV4TinyConfig()
+    decoder = LatentMemoryDecoder(
+        latent_size=cfg.latent_memory_size,
+        head_dim=cfg.head_dim,
+    )
+    b = 4
+    latent = torch.randn(b, cfg.latent_memory_size) * 10  # large values to test sigmoid
+    _, _, confidence, _ = decoder(latent)
+    assert confidence.min() >= 0.0, "Confidence should be >= 0"
+    assert confidence.max() <= 1.0, "Confidence should be <= 1"

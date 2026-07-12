@@ -7,7 +7,6 @@ on attention projections.
 Usage:
     uv run python scripts/finetune_lora.py --checkpoint outputs/warm_start/compression_weights.pt
 """
-
 from __future__ import annotations
 
 import argparse
@@ -19,7 +18,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from torch.optim import AdamW
 from tqdm import tqdm
 
@@ -70,29 +69,40 @@ def add_lora_to_model(
     return lora_modules
 
 
-class RandomFineTuneDataset(Dataset):
-    """Synthetic dataset for fine-tuning.
+def make_dataset(args):
+    """Build training dataset — real HuggingFace data or random fallback."""
+    if args.dataset:
+        from dsv4_tiny.data import TokenizedTextDataset
+        from transformers import AutoTokenizer
 
-    In production, replace with ultrachat_200k filtered to 20K.
-    """
-
-    def __init__(self, vocab_size: int = 248320, seq_len: int = 2048, num_samples: int = 20000):
-        self.vocab_size = vocab_size
-        self.seq_len = seq_len
-        self.num_samples = num_samples
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-    def __getitem__(self, idx: int) -> dict:
-        input_ids = torch.randint(0, min(50000, self.vocab_size), (self.seq_len,))
-        labels = input_ids.clone()
-        return {"input_ids": input_ids, "labels": labels}
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+        return TokenizedTextDataset(
+            hf_path=args.dataset,
+            tokenizer=tokenizer,
+            seq_len=args.seq_len,
+            max_samples=args.num_samples,
+        )
+    # Fallback: random token data
+    class _Random(Dataset):
+        def __init__(self, seq_len, num_samples):
+            self.seq_len = seq_len
+            self.num_samples = num_samples
+        def __len__(self):
+            return self.num_samples
+        def __getitem__(self, idx):
+            input_ids = torch.randint(0, 50000, (self.seq_len,))
+            return {"input_ids": input_ids, "labels": input_ids.clone()}
+    return _Random(seq_len=args.seq_len, num_samples=args.num_samples)
 
 
 def main():
     parser = argparse.ArgumentParser(description="DSV4-Tiny Phase 2: LoRA fine-tune")
-    parser.add_argument("--config", type=str, default="configs/dsv4_tiny.yaml")
+    parser.add_argument("--from-config", type=str, default=None,
+                        help="Load training preset from configs/<name>.toml (e.g. rtx4050, t4-colab). "
+                             "Overrides individual CLI flags.")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="HuggingFace dataset path (e.g. HuggingFaceTB/cosmopedia-100k). "
+                             "When set, replaces random data with real text.")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to warm-start compression_weights.pt")
     parser.add_argument("--output", type=str, default="outputs/lora")
@@ -112,6 +122,16 @@ def main():
     parser.add_argument("--cpu_offload_lm_head", action="store_true", default=True,
                         help="Offload LM head to CPU during forward to save GPU memory")
     args = parser.parse_args()
+
+    # Load preset if --from-config is given (overrides defaults above)
+    if args.from_config:
+        from dsv4_tiny.utils import load_training_config
+        preset = load_training_config(args.from_config)
+        for key, val in preset.items():
+            if hasattr(args, key):
+                setattr(args, key, val)
+                print(f"  [config] {key} = {val}")
+            # ignore unknown keys silently
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
@@ -168,15 +188,14 @@ def main():
         warmup_steps=args.warmup_steps,
         total_steps=args.max_steps,
     )
-
     # Dataset
-    dataset = RandomFineTuneDataset(
-        vocab_size=cfg.vocab_size,
-        seq_len=args.seq_len,
-        num_samples=args.num_samples,
-    )
+    dataset = make_dataset(args)
+    is_iterable = isinstance(dataset, IterableDataset)
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=not is_iterable,
+        drop_last=True,
     )
 
     # Output directory

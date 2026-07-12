@@ -1,0 +1,15 @@
+# DSV4-Tiny training preset: T4 16GB (Google Colab Free)
+# Larger batch and longer sequences possible with LoRA
+# Use: !python scripts/finetune_lora.py --from-config t4-colab --checkpoint ...
+
+[train]
+seq_len = 256
+batch_size = 2
+grad_accum = 8
+max_steps = 2000
+warmup_steps = 200
+lr = 2e-4
+log_interval = 20
+save_interval = 500
+cpu_offload_lm_head = true
+use_grad_checkpoint = false

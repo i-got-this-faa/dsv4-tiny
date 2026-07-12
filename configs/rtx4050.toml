@@ -1,0 +1,16 @@
+# DSV4-Tiny training preset: RTX 4050 6GB Laptop GPU
+# 714M model in bf16 — ~2.4 GB headroom for activations + optimizer
+# Use: python scripts/warm_start.py --from-config rtx4050
+#      python scripts/finetune_lora.py --from-config rtx4050 --checkpoint ...
+
+[train]
+seq_len = 64
+batch_size = 1
+grad_accum = 16
+max_steps = 1000
+warmup_steps = 100
+lr = 1e-4
+log_interval = 10
+save_interval = 500
+cpu_offload_lm_head = true
+use_grad_checkpoint = false

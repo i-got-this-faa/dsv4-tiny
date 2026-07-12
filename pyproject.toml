@@ -10,6 +10,7 @@ dependencies = [
     "ninja>=1.13.0",
     "peft>=0.19.1",
     "protobuf>=7.35.1",
+    "pytest>=9.1.1",
     "sentencepiece>=0.2.1",
     "tensorboard>=2.20.0",
     "torch",

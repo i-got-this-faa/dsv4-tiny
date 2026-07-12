@@ -29,14 +29,14 @@ from .utils import apply_rotary_emb, precompute_freqs_cis
 class DSV4Attention(nn.Module):
     """Single layer of DSV4 tiered attention.
 
-    Handles SWA, CSA, and HCA attention types based on layer index.
+    Every layer now computes SWA + CSA + HCA simultaneously (hierarchical memory).
     """
 
-    def __init__(self, config: DSV4TinyConfig, layer_idx: int):
+    def __init__(self, config: DSV4TinyConfig, layer_idx: int, shared_W_DQ: Optional[nn.Linear] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.layer_type = config.layer_type(layer_idx)
+        self.layer_type = "hierarchical"
 
         d = config.hidden_size               # 1024
         n_h = config.num_attention_heads     # 8
@@ -53,37 +53,37 @@ class DSV4Attention(nn.Module):
         # ── Q projection (from base model) ──
         self.q_proj = nn.Linear(d, n_h * head_dim, bias=False)
 
-        # ── K/V projections (used only for SWA layers) ──
-        if self.layer_type == "swa":
-            self.k_proj = nn.Linear(d, n_kv * head_dim, bias=False)
-            self.v_proj = nn.Linear(d, n_kv * head_dim, bias=False)
-        else:
-            # For compressed layers, KV comes from cache via learned decompression
-            self.kv_decompress = nn.Linear(
-                self._compressed_kv_dim(), head_dim * 2, bias=False
-            )
+        # ── K/V projections (for SWA tier — always present) ──
+        self.k_proj = nn.Linear(d, n_kv * head_dim, bias=False)
+        self.v_proj = nn.Linear(d, n_kv * head_dim, bias=False)
+
 
         # ── Decomposed query (shared with indexer) ──
         c_I = config.indexer_dim            # 128
         n_Ih = config.indexer_heads         # 8
-        self.W_DQ = nn.Linear(d, c_I * n_Ih, bias=False)
+        if config.shared_W_DQ and shared_W_DQ is not None:
+            self.W_DQ = shared_W_DQ
+        else:
+            self.W_DQ = nn.Linear(d, c_I * n_Ih, bias=False)
+
 
         # ── Up-projected query for CSA ──
-        if self.layer_type == "csa":
-            # Per-head up-projection: c_I -> head_dim
-            self.W_UQ = nn.Linear(c_I, head_dim, bias=False)
+        self.W_UQ = nn.Linear(c_I, head_dim, bias=False)
 
         # ── Output projection with gate ──
         self.o_proj = nn.Linear(n_h * head_dim, d, bias=False)
         if config.attn_output_gate:
-            # Gate: element-wise gating of output
             self.o_gate = nn.Linear(n_h * head_dim, d, bias=False)
 
-        # ── Attention sink token (Eq 27) ──
-        # Shape: (1, 1, head_dim) — shared KV head for all layers
-        self.sink_token = nn.Parameter(torch.randn(1, 1, head_dim) * 0.02)
+        # ── Per-attention-type sink tokens ──
+        self.sink_swa = nn.Parameter(torch.randn(1, 1, head_dim) * 0.02)
+        self.sink_csa = nn.Parameter(torch.randn(1, 1, head_dim) * 0.02)
+        self.sink_hca = nn.Parameter(torch.randn(1, 1, head_dim) * 0.02)
 
-
+        # ── Learned combination weights for output fusion ──
+        self.alpha_swa = nn.Parameter(torch.tensor(1.0))
+        self.alpha_csa = nn.Parameter(torch.tensor(1.0))
+        self.alpha_hca = nn.Parameter(torch.tensor(1.0))
 
         # ── RoPE (partial: last rope_dim dims) ──
         self.rope_dim = rope_dim
@@ -95,19 +95,6 @@ class DSV4Attention(nn.Module):
 
         # Head counts for GQA
         self.n_groups = n_h // n_kv  # 4 heads per KV head
-
-    def _compressed_kv_dim(self) -> int:
-        """Return the dim of compressed KV for this layer type."""
-        cfg = self.config
-        if self.layer_type == "csa":
-            # CSA: all sub-blocks concatenated: (c*g + d_c) * (block_size / csa_block_size)
-            sub_block_dim = cfg.csa_compressed_dim * cfg.csa_groups + cfg.csa_intermediate
-            num_sub_blocks = cfg.block_alignment // cfg.csa_block_size  # 128/4 = 32
-            return sub_block_dim * num_sub_blocks
-        elif self.layer_type == "hca":
-            # HCA: c_hca (one block per 128-token aligned block)
-            return cfg.hca_compressed_dim
-        return 0
 
     def _get_rope_freqs(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Get or precompute RoPE frequencies (cos, sin)."""
@@ -126,7 +113,7 @@ class DSV4Attention(nn.Module):
         cache: Optional[DSV4Cache] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass for a single layer.
+        """Forward pass for a single layer — all three tiers simultaneously.
 
         Args:
             hidden_states: (batch_size, seq_len, d)
@@ -148,16 +135,30 @@ class DSV4Attention(nn.Module):
         freqs_cos, freqs_sin = self._get_rope_freqs(seq_len, device)
         q = apply_rotary_emb(q, freqs_cos, freqs_sin, partial_dim=self.rope_dim)
 
-        if self.layer_type == "swa":
-            output = self._forward_swa(hidden_states, q, cache)
-        elif self.layer_type == "csa":
-            output = self._forward_csa(hidden_states, q, cache)
-        elif self.layer_type == "hca":
-            output = self._forward_hca(hidden_states, q, cache)
-        else:
-            raise ValueError(f"Unknown layer type: {self.layer_type}")
+        # 3. Run all three tiers
+        out_swa = self._forward_swa(hidden_states, q, cache)
+        out_csa = self._forward_csa(hidden_states, q, cache)
+        out_hca = self._forward_hca(hidden_states, q, cache)
+
+        # 4. Learned weighted combination
+        alpha_swa = torch.sigmoid(self.alpha_swa)
+        alpha_csa = torch.sigmoid(self.alpha_csa)
+        alpha_hca = torch.sigmoid(self.alpha_hca)
+        output = alpha_swa * out_swa + alpha_csa * out_csa + alpha_hca * out_hca
 
         return output
+
+    def _compute_cq(self, hidden_states: torch.Tensor) -> tuple:
+        """Compute decomposed query shared by CSA and HCA.
+
+        Returns:
+            cQ: (b, seq_len, n_Ih, c_I) decomposed query
+        """
+        cQ = self.W_DQ(hidden_states)  # (b, seq_len, c_I * n_Ih)
+        c_I = self.config.indexer_dim
+        n_Ih = self.config.indexer_heads
+        cQ = cQ.view(-1, hidden_states.shape[1], n_Ih, c_I)  # (b, seq_len, n_Ih, c_I)
+        return cQ
 
     def _forward_swa(
         self,
@@ -195,19 +196,8 @@ class DSV4Attention(nn.Module):
                     hidden_state=hs,
                 )
 
-            # Combine with cached state window
-            win_k, win_v = cache.get_state_window(self.layer_idx)
-            # win_k/v: (win_len, n_kv, head_dim)
-            if win_k.numel() > 0 and win_k.shape[0] > 0:
-                # Remove the current sequence's contribution from window
-                # (since cache already updated, window includes the current seq)
-                # The window already has the sliding KV; we use the current
-                # seq's K/V for the actual attention computation.
-                pass
-
             # Also get uncompressed tail for context
             tail_k, tail_v = cache.get_tail_kv(self.layer_idx)
-            # tail_k/v: (tail_len, n_kv, head_dim)
         else:
             # No cache — compute K/V directly for this sequence
             k = self.k_proj(hidden_states).view(b, seq_len, n_kv, head_dim)
@@ -221,7 +211,7 @@ class DSV4Attention(nn.Module):
         if cache is not None:
             win_k, win_v = cache.get_state_window(self.layer_idx)
             if win_k.numel() > 0:
-                k_full = torch.cat([win_k.unsqueeze(0), k], dim=1)   # (b, win_len + seq_len, n_kv, head_dim)
+                k_full = torch.cat([win_k.unsqueeze(0), k], dim=1)
                 v_full = torch.cat([win_v.unsqueeze(0), v], dim=1)
             else:
                 k_full = k
@@ -231,18 +221,16 @@ class DSV4Attention(nn.Module):
             v_full = v
 
         # Apply attention sink — expand to match n_kv heads
-        sink_k = self.sink_token.unsqueeze(0).expand(b, -1, self.n_kv, -1)  # (b, 1, n_kv, head_dim)
-        sink_v = self.sink_token.unsqueeze(0).expand(b, -1, self.n_kv, -1)
+        sink_k = self.sink_swa.unsqueeze(0).expand(b, -1, self.n_kv, -1)  # (b, 1, n_kv, head_dim)
+        sink_v = self.sink_swa.unsqueeze(0).expand(b, -1, self.n_kv, -1)
         k_full = torch.cat([sink_k, k_full], dim=1)
         v_full = torch.cat([sink_v, v_full], dim=1)
         # GQA: expand KV heads to match query heads
-        # Q: (b, seq_len, n_h, head_dim), K/V: (b, total_len, n_kv, head_dim)
-        k_full = k_full.repeat_interleave(self.n_groups, dim=2)  # (b, total_len, n_h, head_dim)
+        k_full = k_full.repeat_interleave(self.n_groups, dim=2)
         v_full = v_full.repeat_interleave(self.n_groups, dim=2)
 
         # Attention
         scale = 1.0 / math.sqrt(head_dim)
-        # (b, n_h, seq_len, total_len)
         attn_weights = torch.einsum("bqhd,bkhd->bhqk", q, k_full) * scale
 
         # Causal mask with window constraint
@@ -250,10 +238,8 @@ class DSV4Attention(nn.Module):
         mask = torch.full((seq_len, total_len), float("-inf"), device=device, dtype=dtype)
         sink_offset = 1  # sink token
         for i in range(seq_len):
-            # Causal: can attend to positions <= current + sink
             max_k = i + sink_offset
             mask[i, :max_k + 1] = 0.0
-            # Window: only last window_size positions (excluding sink)
             window = self.config.swa_window_size
             min_k = max(0, i + sink_offset - window)
             if min_k > sink_offset:
@@ -263,7 +249,7 @@ class DSV4Attention(nn.Module):
         attn_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
 
         # Output
-        attn_output = torch.einsum("bhqk,bkhd->bqhd", attn_probs, v_full)  # (b, seq_len, n_h, head_dim)
+        attn_output = torch.einsum("bhqk,bkhd->bqhd", attn_probs, v_full)
         attn_output = attn_output.reshape(b, seq_len, self.n_h * head_dim)
 
         # Output projection with gate
@@ -280,116 +266,119 @@ class DSV4Attention(nn.Module):
         q: torch.Tensor,
         cache: Optional[DSV4Cache],
     ) -> torch.Tensor:
-        """Compressed Sparse Attention using Tier 2 cache."""
+        """Compressed Sparse Attention using Tier 2 cache — per-KV-head GQA."""
         b, seq_len, d = hidden_states.shape
         device = hidden_states.device
         dtype = hidden_states.dtype
         head_dim = self.head_dim
         n_h = self.n_h
-        n_kv = self.n_kv
+        kv_heads = self.n_kv
+        groups = self.n_groups
 
         # ── Decomposed query (shared with indexer) ──
-        cQ = self.W_DQ(hidden_states)  # (b, seq_len, c_I * n_Ih)
-        c_I = self.config.indexer_dim
-        n_Ih = self.config.indexer_heads
-        cQ = cQ.view(b, seq_len, n_Ih, c_I)  # (b, seq_len, n_Ih, c_I)
+        cQ = self._compute_cq(hidden_states)  # (b, seq_len, n_Ih, c_I)
 
         # ── Up-projected query for CSA ──
         q_up = self.W_UQ(cQ)  # (b, seq_len, n_Ih, head_dim)
-        # Rename for clarity: q_up is the CSA query, same dim as q
         q_csa = q_up
 
         # Apply partial RoPE to CSA query
         freqs_cos, freqs_sin = self._get_rope_freqs(seq_len, device)
         q_csa = apply_rotary_emb(q_csa, freqs_cos, freqs_sin, partial_dim=self.rope_dim)
 
-        # Also keep the standard Q for the uncompressed tail portion
-        # Standard Q: use q directly for the tail
+        # ── Batched no-cache path (pure sink-token attention, training) ──
+        if cache is None:
+            # Only sink token available — batched across all positions
+            sink_k = self.sink_csa.squeeze(1).expand(kv_heads, -1).unsqueeze(0)  # (1, kv_heads, hd)
+            sink_v = self.sink_csa.squeeze(1).expand(kv_heads, -1).unsqueeze(0)
+            k_all = sink_k  # (1, kv_heads, hd)
+            v_all = sink_v
+            k_all_t = k_all.transpose(0, 1)  # (kv_heads, 1, hd)
+            v_all_t = v_all.transpose(0, 1)
+            scale = 1.0 / math.sqrt(head_dim)
+            # Batched over seq_len
+            q_gqa = q_csa.view(b, seq_len, kv_heads, groups, head_dim)  # (b, seq_len, kv_heads, groups, hd)
+            scores = torch.einsum("blgqd,gkd->blgqk", q_gqa, k_all_t) * scale
+            attn_probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(dtype)
+            attn_out = torch.einsum("blgqk,gkd->blgqd", attn_probs, v_all_t)
+            attn_out = attn_out.reshape(b, seq_len, n_h, head_dim)
+            attn_out = attn_out.reshape(b, seq_len, n_h * head_dim)
+            out = self.o_proj(attn_out)
+            if hasattr(self, "o_gate"):
+                gate_val = torch.sigmoid(self.o_gate(attn_out))
+                out = out * gate_val
+            return out
 
         output_chunks = []
         for t in range(seq_len):
-            # Push hidden state to cache (for future compression)
-            if cache is not None:
-                cache.push(
-                    self.layer_idx,
-                    hidden_states[:, t].squeeze(0),  # key proxy
-                    hidden_states[:, t].squeeze(0),  # value proxy
-                    hidden_state=hidden_states[:, t].squeeze(0),
-                )
-
             # ── Get compressed blocks from Tier 2 cache ──
             query_hidden = hidden_states[:, t]  # (b, d)
             compressed_blocks = cache.get_sparse(self.layer_idx, query_hidden) if cache else []
 
-            # ── Get uncompressed tail ──
+            # ── Get uncompressed tail (per-KV-head) ──
             tail_k, tail_v = cache.get_tail_kv(self.layer_idx) if cache else (torch.tensor([]), torch.tensor([]))
 
             # ── Compute attention at this position ──
-            # CSA query at position t
-            q_t = q_csa[:, t]  # (b, n_h, head_dim) — q_up per head
+            q_t = q_csa[:, t]  # (b, n_h, head_dim)
 
-            # Attention sink — squeeze to (1, head_dim) to match other keys
-            sink_k = self.sink_token.squeeze(1)  # (1, head_dim)
-            sink_v = self.sink_token.squeeze(1)
+            # Attention sink — per-KV-head
+            sink_k = self.sink_csa.squeeze(1)  # (1, head_dim)
+            sink_v = self.sink_csa.squeeze(1)
+            sink_k = sink_k.expand(kv_heads, -1)
+            sink_v = sink_v.expand(kv_heads, -1)
 
-            # Initialize key/value lists
             keys = []
             values = []
 
-            # 1. Sink token
-            keys.append(sink_k)
-            values.append(sink_v)
+            # 1. Sink token — (1, kv_heads, head_dim)
+            keys.append(sink_k.unsqueeze(0))
+            values.append(sink_v.unsqueeze(0))
 
-
-            # 2. Compressed blocks (Tier 2)
+            # 2. Compressed blocks (Tier 2) — expand decoder output to kv_heads
             if compressed_blocks:
-                # Decompress each block
                 for block in compressed_blocks:
-                    # block.compressed_kv: (compressed_dim,)
-                    decomp = self.kv_decompress(block.compressed_kv.unsqueeze(0))  # (1, head_dim * 2)
-                    k_block = decomp[:, :head_dim]     # (1, head_dim)
-                    v_block = decomp[:, head_dim:]     # (1, head_dim)
+                    k_block, v_block, _, _ = cache.decoder(latent)
+                    k_block = k_block.expand(1, kv_heads, -1)  # (1, kv_heads, head_dim)
+                    v_block = v_block.expand(1, kv_heads, -1)
                     keys.append(k_block)
                     values.append(v_block)
 
-            # 3. Uncompressed tail (handle both (tail_len, kv_heads, head_dim) and (tail_len, hidden_size))
+            # 3. Uncompressed tail — already (tail_len, kv_heads, head_dim)
             if tail_k.numel() > 0 and tail_k.shape[0] > 0:
-                if tail_k.dim() == 3:
-                    # KV format: (tail_len, kv_heads, head_dim) -> average heads
-                    tk = tail_k.mean(dim=1)  # (tail_len, head_dim)
-                    tv = tail_v.mean(dim=1)
-                elif tail_k.dim() == 2 and tail_k.shape[-1] == self.head_dim:
-                    tk = tail_k  # (tail_len, head_dim)
-                    tv = tail_v
+                if tail_k.dim() == 3 and tail_k.shape[1] == kv_heads:
+                    keys.append(tail_k)
+                    values.append(tail_v)
+                elif tail_k.dim() == 2 and tail_k.shape[-1] == head_dim:
+                    keys.append(tail_k.unsqueeze(1).expand(-1, kv_heads, -1))
+                    values.append(tail_v.unsqueeze(1).expand(-1, kv_heads, -1))
                 else:
-                    # Hidden state format: (tail_len, hidden_size) -> project to head_dim
-                    # Use a simple learned projection if available, else mean pool
-                    if tail_k.shape[-1] >= self.head_dim:
-                        tk = tail_k[:, :self.head_dim]  # truncate
-                        tv = tail_v[:, :self.head_dim]
+                    if tail_k.shape[-1] >= head_dim:
+                        tk = tail_k[:, :head_dim]
+                        tv = tail_v[:, :head_dim]
                     else:
-                        # Pad if too small (shouldn't happen with d=1024, head_dim=256)
-                        repeats = (self.head_dim + tail_k.shape[-1] - 1) // tail_k.shape[-1]
-                        tk = tail_k.repeat(1, repeats)[:, :self.head_dim]
-                        tv = tail_v.repeat(1, repeats)[:, :self.head_dim]
-                keys.append(tk)
-                values.append(tv)
+                        repeats = (head_dim + tail_k.shape[-1] - 1) // tail_k.shape[-1]
+                        tk = tail_k.repeat(1, repeats)[:, :head_dim]
+                        tv = tail_v.repeat(1, repeats)[:, :head_dim]
+                    keys.append(tk.unsqueeze(1).expand(-1, kv_heads, -1))
+                    values.append(tv.unsqueeze(1).expand(-1, kv_heads, -1))
 
-            k_all = torch.cat(keys, dim=0).unsqueeze(0)   # (1, num_keys, head_dim)
-            v_all = torch.cat(values, dim=0).unsqueeze(0)  # (1, num_keys, head_dim)
+            k_all = torch.cat(keys, dim=0)   # (n_keys, kv_heads, head_dim)
+            v_all = torch.cat(values, dim=0)
 
-            # MQA: all query heads share K/V
-            # Q: (b, n_h, hd), K: (num_keys, hd) -> scores: (b, n_h, num_keys)
+            # Transpose K/V for GQA einsum: (kv_heads, n_keys, head_dim)
+            k_all_t = k_all.transpose(0, 1)
+            v_all_t = v_all.transpose(0, 1)
+
+            # GQA attention: per-kv-head groups
             scale = 1.0 / math.sqrt(head_dim)
-            scores = torch.einsum("bnd,kd->bnk", q_t, k_all.squeeze(0)) * scale
+            q_gqa = q_t.view(b, kv_heads, groups, head_dim)
+            scores = torch.einsum("bgqd,gkd->bgqk", q_gqa, k_all_t) * scale
 
             attn_probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(dtype)
-            # (b, n_h, num_keys) @ (num_keys, hd) -> (b, n_h, hd)
-            attn_out = torch.einsum("bnk,kd->bnd", attn_probs, v_all.squeeze(0))
-
+            attn_out = torch.einsum("bgqk,gkd->bgqd", attn_probs, v_all_t)
+            attn_out = attn_out.reshape(b, n_h, head_dim)
             attn_out = attn_out.reshape(b, n_h * head_dim)
 
-            # Output projection with gate
             out = self.o_proj(attn_out)
             if hasattr(self, "o_gate"):
                 gate_val = torch.sigmoid(self.o_gate(attn_out))
@@ -405,40 +394,48 @@ class DSV4Attention(nn.Module):
         q: torch.Tensor,
         cache: Optional[DSV4Cache],
     ) -> torch.Tensor:
-        """Heavy Compressed Attention using Tier 3 cache."""
+        """Heavy Compressed Attention using Tier 3 cache — per-KV-head GQA."""
+
+
         b, seq_len, d = hidden_states.shape
         device = hidden_states.device
         dtype = hidden_states.dtype
         head_dim = self.head_dim
         n_h = self.n_h
+        kv_heads = self.n_kv
+        groups = self.n_groups
 
+        # Use standard Q as the attention query (n_h, head_dim)
+        q_attn = q
 
-        # For HCA, use the decomposed query (no up-projection)
-        cQ = self.W_DQ(hidden_states)  # (b, seq_len, c_I * n_Ih)
-        c_I = self.config.indexer_dim
-        n_Ih = self.config.indexer_heads
-        q_hca = cQ.view(b, seq_len, n_Ih, c_I)  # (b, seq_len, n_Ih, c_I)
-
-        # For HCA, query dim (c_I=128) differs from head_dim (256).
-        # We need a projection from c_I to head_dim for the attention computation.
-        # Use Q from standard projection as the attention query.
-        # The decomposed query cQ is used for scoring blocks.
-        q_attn = q  # Use standard Q: (b, seq_len, n_h, head_dim)
+        # Decomposed query (for future indexer scoring; not up-projected for HCA)
+        _ = self._compute_cq(hidden_states)
 
         freqs_cos, freqs_sin = self._get_rope_freqs(seq_len, device)
         q_attn = apply_rotary_emb(q_attn, freqs_cos, freqs_sin, partial_dim=self.rope_dim)
+        # ── Batched no-cache path (pure sink-token attention, training) ──
+        if cache is None:
+            sink_k = self.sink_hca.squeeze(1).expand(kv_heads, -1).unsqueeze(0)
+            sink_v = self.sink_hca.squeeze(1).expand(kv_heads, -1).unsqueeze(0)
+            k_all = sink_k
+            v_all = sink_v
+            k_all_t = k_all.transpose(0, 1)
+            v_all_t = v_all.transpose(0, 1)
+            scale = 1.0 / math.sqrt(head_dim)
+            q_gqa = q_attn.view(b, seq_len, kv_heads, groups, head_dim)
+            scores = torch.einsum("blgqd,gkd->blgqk", q_gqa, k_all_t) * scale
+            attn_probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(dtype)
+            attn_out = torch.einsum("blgqk,gkd->blgqd", attn_probs, v_all_t)
+            attn_out = attn_out.reshape(b, seq_len, n_h, head_dim)
+            attn_out = attn_out.reshape(b, seq_len, n_h * head_dim)
+            out = self.o_proj(attn_out)
+            if hasattr(self, "o_gate"):
+                gate_val = torch.sigmoid(self.o_gate(attn_out))
+                out = out * gate_val
+            return out
 
         output_chunks = []
         for t in range(seq_len):
-            # Push hidden state to cache (for future compression)
-            if cache is not None:
-                cache.push(
-                    self.layer_idx,
-                    hidden_states[:, t].squeeze(0),  # key proxy
-                    hidden_states[:, t].squeeze(0),  # value proxy
-                    hidden_state=hidden_states[:, t].squeeze(0),
-                )
-
             # ── Get all compressed blocks from Tier 3 cache ──
             blocks = cache.get_dense(self.layer_idx) if cache else []
 
@@ -448,56 +445,60 @@ class DSV4Attention(nn.Module):
             # ── HCA query at position t ──
             q_t = q_attn[:, t]  # (b, n_h, head_dim)
 
-            # Attention sink — squeeze to (1, head_dim) to match other keys
-            sink_k = self.sink_token.squeeze(1)  # (1, head_dim)
-            sink_v = self.sink_token.squeeze(1)
-
+            # Attention sink — per-KV-head
+            sink_k = self.sink_hca.squeeze(1)
+            sink_v = self.sink_hca.squeeze(1)
+            sink_k = sink_k.expand(kv_heads, -1)
+            sink_v = sink_v.expand(kv_heads, -1)
 
             keys = []
             values = []
 
-            # 1. Sink token
-            keys.append(sink_k)
-            values.append(sink_v)
+            # 1. Sink token — (1, kv_heads, head_dim)
+            keys.append(sink_k.unsqueeze(0))
+            values.append(sink_v.unsqueeze(0))
 
-            # 2. Compressed blocks (Tier 3) — all dense
+            # 2. Compressed blocks (Tier 3) — expand decoder output to kv_heads
             if blocks:
                 for block in blocks:
-                    decomp = self.kv_decompress(block.compressed_kv.unsqueeze(0))  # (1, head_dim * 2)
-                    k_block = decomp[:, :head_dim]
-                    v_block = decomp[:, head_dim:]
+                    k_block, v_block, _, _ = cache.decoder(latent)
+                    k_block = k_block.expand(1, kv_heads, -1)
+                    v_block = v_block.expand(1, kv_heads, -1)
                     keys.append(k_block)
                     values.append(v_block)
 
-            # 3. Uncompressed tail (handle both KV and hidden state formats)
+            # 3. Uncompressed tail — already (tail_len, kv_heads, head_dim)
             if tail_k.numel() > 0 and tail_k.shape[0] > 0:
-                if tail_k.dim() == 3:
-                    tk = tail_k.mean(dim=1)
-                    tv = tail_v.mean(dim=1)
-                elif tail_k.dim() == 2 and tail_k.shape[-1] == self.head_dim:
-                    tk = tail_k
-                    tv = tail_v
+                if tail_k.dim() == 3 and tail_k.shape[1] == kv_heads:
+                    keys.append(tail_k)
+                    values.append(tail_v)
+                elif tail_k.dim() == 2 and tail_k.shape[-1] == head_dim:
+                    keys.append(tail_k.unsqueeze(1).expand(-1, kv_heads, -1))
+                    values.append(tail_v.unsqueeze(1).expand(-1, kv_heads, -1))
                 else:
-                    if tail_k.shape[-1] >= self.head_dim:
-                        tk = tail_k[:, :self.head_dim]
-                        tv = tail_v[:, :self.head_dim]
+                    if tail_k.shape[-1] >= head_dim:
+                        tk = tail_k[:, :head_dim]
+                        tv = tail_v[:, :head_dim]
                     else:
-                        repeats = (self.head_dim + tail_k.shape[-1] - 1) // tail_k.shape[-1]
-                        tk = tail_k.repeat(1, repeats)[:, :self.head_dim]
-                        tv = tail_v.repeat(1, repeats)[:, :self.head_dim]
-                keys.append(tk)
-                values.append(tv)
+                        repeats = (head_dim + tail_k.shape[-1] - 1) // tail_k.shape[-1]
+                        tk = tail_k.repeat(1, repeats)[:, :head_dim]
+                        tv = tail_v.repeat(1, repeats)[:, :head_dim]
+                    keys.append(tk.unsqueeze(1).expand(-1, kv_heads, -1))
+                    values.append(tv.unsqueeze(1).expand(-1, kv_heads, -1))
 
-            k_all = torch.cat(keys, dim=0).unsqueeze(0)
-            v_all = torch.cat(values, dim=0).unsqueeze(0)
+            k_all = torch.cat(keys, dim=0)
+            v_all = torch.cat(values, dim=0)
 
-            # MQA attention
+            k_all_t = k_all.transpose(0, 1)
+            v_all_t = v_all.transpose(0, 1)
+
             scale = 1.0 / math.sqrt(head_dim)
-            scores = torch.einsum("bnd,kd->bnk", q_t, k_all.squeeze(0)) * scale
+            q_gqa = q_t.view(b, kv_heads, groups, head_dim)
+            scores = torch.einsum("bgqd,gkd->bgqk", q_gqa, k_all_t) * scale
 
             attn_probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(dtype)
-            attn_out = torch.einsum("bnk,kd->bnd", attn_probs, v_all.squeeze(0))
-
+            attn_out = torch.einsum("bgqk,gkd->bgqd", attn_probs, v_all_t)
+            attn_out = attn_out.reshape(b, n_h, head_dim)
             attn_out = attn_out.reshape(b, n_h * head_dim)
 
             out = self.o_proj(attn_out)
@@ -508,3 +509,4 @@ class DSV4Attention(nn.Module):
             output_chunks.append(out)
 
         return torch.stack(output_chunks, dim=1)
+

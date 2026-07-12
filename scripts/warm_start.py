@@ -1,27 +1,24 @@
-#!/usr/bin/env python3
 """DSV4-Tiny Phase 1: Warm-start compression weights.
 
-Trains CSACompressor, HCACompressor, LightningIndexer, and attention
-W_DQ/W_UQ weights via autoencoder-style loss.
+Trains compression modules (encoder/decoder, indexer) via LM loss.
 
 Usage:
-    uv run python scripts/warm_start.py --config configs/dsv4_tiny.yaml --output outputs/warm_start/
+    uv run python scripts/warm_start.py --from-config rtx4050 --output outputs/warm_start/
+    uv run python scripts/warm_start.py --from-config rtx4050 --dataset HuggingFaceTB/cosmopedia-100k
+    uv run python scripts/warm_start.py --seq_len 128 --max_steps 500
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from accelerate import cpu_offload
 from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm import tqdm
 
 # Add src to path
@@ -33,28 +30,40 @@ from dsv4_tiny.utils import get_linear_schedule_with_cosine_decay
 
 
 class RandomTextDataset(Dataset):
-    """Synthetic dataset for warm-start training.
+    """Synthetic random token dataset — fallback."""
 
-    In production, replace with a slice of fine-tuning data.
-    """
-
-    def __init__(
-        self,
-        vocab_size: int = 248320,
-        seq_len: int = 2048,
-        num_samples: int = 10000,
-    ):
+    def __init__(self, vocab_size=248044, seq_len=64, num_samples=10000):
         self.vocab_size = vocab_size
         self.seq_len = seq_len
         self.num_samples = num_samples
 
-    def __len__(self) -> int:
+    def __len__(self):
         return self.num_samples
 
-    def __getitem__(self, idx: int) -> dict:
-        # Synthetic random tokens (replace with real data in production)
+    def __getitem__(self, idx):
         input_ids = torch.randint(0, min(50000, self.vocab_size), (self.seq_len,))
         return {"input_ids": input_ids}
+
+
+def make_dataset(args):
+    """Build training dataset — real HuggingFace data or random fallback."""
+    if args.dataset:
+        from dsv4_tiny.data import TokenizedTextDataset
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+        return TokenizedTextDataset(
+            hf_path=args.dataset,
+            tokenizer=tokenizer,
+            seq_len=args.seq_len,
+            max_samples=args.num_samples,
+        )
+    return RandomTextDataset(
+        vocab_size=248044,
+        seq_len=args.seq_len,
+        num_samples=args.num_samples,
+    )
+
 
 def warm_start_loss(
     model: DSV4TinyForCausalLM,
@@ -62,16 +71,9 @@ def warm_start_loss(
     cpu_offload_lm_head: bool = False,
     use_grad_checkpoint: bool = False,
 ) -> torch.Tensor:
-    """Compute warm-start loss: autoencoder-style compression loss.
+    """Compute warm-start loss: autoencoder-style compression training.
 
-    Steps:
-    1. Forward through the model with cache enabled
-    2. For each CSA/HCA layer, compute compressed and uncompressed attention outputs
-    3. MSE + KL divergence between compressed and uncompressed outputs
-
-    For v1, uses the overall LM loss as the training signal since we don't
-    have a separate reconstruction head. The compression modules are trained
-    via gradients flowing through the full model.
+    Forward through the model with cache enabled; LM loss trains compression modules.
     """
     outputs = model(
         input_ids,
@@ -80,18 +82,27 @@ def warm_start_loss(
         cpu_offload_lm_head=cpu_offload_lm_head,
         use_grad_checkpoint=use_grad_checkpoint,
     )
-    loss = outputs["loss"]
-
-    # Additional auxiliary losses from cache statistics could be added
-    # in future versions. For now, the base LM loss provides a good
-    # training signal because compression affects attention quality.
-
-    return loss
+    return outputs["loss"]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DSV4-Tiny Phase 1: Warm-start compression weights")
-    parser.add_argument("--config", type=str, default="configs/dsv4_tiny.yaml")
+    parser = argparse.ArgumentParser(
+        description="DSV4-Tiny Phase 1: Warm-start compression weights"
+    )
+    parser.add_argument(
+        "--from-config",
+        type=str,
+        default=None,
+        help="Load training preset from configs/<name>.toml (e.g. rtx4050, t4-colab). "
+        "Overrides individual CLI flags.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="HuggingFace dataset path (e.g. HuggingFaceTB/cosmopedia-100k). "
+        "When set, replaces random data with real text.",
+    )
     parser.add_argument("--output", type=str, default="outputs/warm_start")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -100,18 +111,44 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=200)
-    parser.add_argument("--seq_len", type=int, default=64,
-                        help="Sequence length per sample. 64-128 recommended for 6GB GPU.")
+    parser.add_argument(
+        "--seq_len",
+        type=int,
+        default=64,
+        help="Sequence length per sample. 64-128 recommended for 6GB GPU.",
+    )
     parser.add_argument("--num_samples", type=int, default=10000)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--cpu_offload_lm_head", action="store_true", default=True,
-                        help="Offload LM head to CPU during forward to save GPU memory")
-    parser.add_argument("--grad_checkpoint", action="store_true", default=False,
-                        help="Gradient checkpointing per decoder layer. Slower but saves activation memory. "
-                             "Disable by default because CSA/HCA token loops are already slow.")
+    parser.add_argument(
+        "--cpu_offload_lm_head",
+        action="store_true",
+        default=True,
+        help="Offload LM head to CPU during forward to save GPU memory",
+    )
+    parser.add_argument(
+        "--grad_checkpoint",
+        action="store_true",
+        default=False,
+        help="Gradient checkpointing per decoder layer.",
+    )
     args = parser.parse_args()
 
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    # Load preset if --from-config is given (overrides defaults above)
+    if args.from_config:
+        from dsv4_tiny.utils import load_training_config
+
+        preset = load_training_config(args.from_config)
+        for key, val in preset.items():
+            if hasattr(args, key):
+                setattr(args, key, val)
+                print(f"  [config] {key} = {val}")
+            elif key in ("use_grad_checkpoint",):
+                setattr(args, "grad_checkpoint", val)
+            # ignore unknown keys silently
+
+    device = torch.device(
+        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     print(f"Using device: {device}")
 
     # Config
@@ -123,14 +160,21 @@ def main():
 
     # Freeze base model weights (embeddings, MLPs, norms, LM head)
     for name, param in model.named_parameters():
-        if any(skip in name for skip in [
-            "embed_tokens", "mlp", "lm_head", "norm",
-            "input_layernorm", "post_attention_layernorm",
-        ]):
+        if any(
+            skip in name
+            for skip in [
+                "embed_tokens",
+                "mlp",
+                "lm_head",
+                "norm",
+                "input_layernorm",
+                "post_attention_layernorm",
+            ]
+        ):
             param.requires_grad = False
         elif "self_attn" in name:
             # Only train compression-specific weights in attention
-            if any(k in name for k in ["W_DQ", "W_UQ", "kv_decompress", "o_proj", "o_gate"]):
+            if any(k in name for k in ["W_DQ", "W_UQ", "o_proj", "o_gate"]):
                 param.requires_grad = True
             elif "sink_token" in name:
                 param.requires_grad = True
@@ -163,13 +207,13 @@ def main():
     )
 
     # Dataset
-    dataset = RandomTextDataset(
-        vocab_size=cfg.vocab_size,
-        seq_len=args.seq_len,
-        num_samples=args.num_samples,
-    )
+    dataset = make_dataset(args)
+    is_iterable = isinstance(dataset, IterableDataset)
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=not is_iterable,
+        drop_last=True,
     )
 
     # Output directory
@@ -192,7 +236,8 @@ def main():
             input_ids = batch["input_ids"].to(device)
 
             loss = warm_start_loss(
-                model, input_ids,
+                model,
+                input_ids,
                 cpu_offload_lm_head=args.cpu_offload_lm_head,
                 use_grad_checkpoint=args.grad_checkpoint,
             )
@@ -215,10 +260,12 @@ def main():
 
             if global_step % args.log_interval == 0:
                 avg_loss = running_loss / args.log_interval
-                progress_bar.set_postfix({
-                    "loss": f"{avg_loss:.4f}",
-                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                })
+                progress_bar.set_postfix(
+                    {
+                        "loss": f"{avg_loss:.4f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                    }
+                )
                 running_loss = 0.0
 
             if global_step % args.save_interval == 0:
@@ -231,7 +278,16 @@ def main():
                     "attention_weights": {
                         k: v.clone().cpu()
                         for k, v in model.state_dict().items()
-                        if any(s in k for s in ["W_DQ", "W_UQ", "kv_decompress", "o_proj", "o_gate", "sink_token"])
+                        if any(
+                            s in k
+                            for s in [
+                                "W_DQ",
+                                "W_UQ",
+                                "o_proj",
+                                "o_gate",
+                                "sink_token",
+                            ]
+                        )
                     },
                     "config": cfg.to_dict(),
                     "step": global_step,
@@ -244,11 +300,16 @@ def main():
 
     # Save final weights
     final_ckpt = {
-        "compression_weights": {k: v.clone().cpu() for k, v in model.cache.state_dict().items()},
+        "compression_weights": {
+            k: v.clone().cpu() for k, v in model.cache.state_dict().items()
+        },
         "attention_weights": {
             k: v.clone().cpu()
             for k, v in model.state_dict().items()
-            if any(s in k for s in ["W_DQ", "W_UQ", "kv_decompress", "o_proj", "o_gate", "sink_token"])
+            if any(
+                s in k
+                for s in ["W_DQ", "W_UQ", "o_proj", "o_gate", "sink_token"]
+            )
         },
         "config": cfg.to_dict(),
         "step": global_step,

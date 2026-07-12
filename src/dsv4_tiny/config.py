@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,26 +76,26 @@ class DSV4TinyConfig:
     bnb_4bit_compute_dtype: str = "bfloat16"
     bnb_4bit_quant_type: str = "nf4"
 
-    # ── Layer type assignment (24 layers, 0-indexed) ──────────────────────
-    # SWA: sliding window (uncompressed)
-    # CSA: compressed sparse attention
-    # HCA: heavy compressed attention
-    swa_layers: tuple[int, ...] = (0, 1)
-    csa_layers: tuple[int, ...] = (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
-    hca_layers: tuple[int, ...] = (3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23)
+    # ── Hierarchical memory mode ────────────────────────────────────────────
+    use_hierarchical: bool = True   # every layer uses all three tiers when True
+    shared_W_DQ: bool = True        # share decomposed query projection across layers
+
+    # ── Per-attention-type sink tokens ─────────────────────────────────────
+    sink_swa: bool = True   # enable SWA sink token
+    sink_csa: bool = True   # enable CSA sink token
+    sink_hca: bool = True   # enable HCA sink token
+
+    # ── Latent memory hyperparameters (encoder–decoder compression) ────────
+    latent_memory_size: int = 128        # dimension of each latent vector
+    latent_slots_per_chunk: int = 4      # number of latent vectors per compressed chunk
+    encoder_hidden: int = 256            # encoder MLP hidden dim
+    decoder_hidden: int = 256            # decoder MLP hidden dim
 
     # ── Serialization helpers ──────────────────────────────────────────────
     _BASE_MODEL_PATH: ClassVar[str] = "Qwen/Qwen3.5-0.8B"
 
     def __post_init__(self) -> None:
         """Validate consistency."""
-        # Layer count
-        n_swa = len(self.swa_layers)
-        n_csa = len(self.csa_layers)
-        n_hca = len(self.hca_layers)
-        assert n_swa + n_csa + n_hca == self.num_hidden_layers, (
-            f"Layer assignment mismatch: {n_swa}+{n_csa}+{n_hca} != {self.num_hidden_layers}"
-        )
 
         # Block alignment
         import math
@@ -163,14 +163,6 @@ class DSV4TinyConfig:
             indexer_dim=128,
         )
 
-    def layer_type(self, layer_idx: int) -> Literal["swa", "csa", "hca"]:
-        if layer_idx in self.swa_layers:
-            return "swa"
-        elif layer_idx in self.csa_layers:
-            return "csa"
-        elif layer_idx in self.hca_layers:
-            return "hca"
-        raise ValueError(f"Layer {layer_idx} not assigned to any type")
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

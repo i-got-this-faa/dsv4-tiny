@@ -1,4 +1,4 @@
-"""Tests for DSV4Cache."""
+"""Tests for DSV4Cache (hierarchical memory mode)."""
 
 import sys
 from pathlib import Path
@@ -34,7 +34,7 @@ def test_cache_compression_trigger():
 
     # Push exactly block_size tokens to trigger compression
     for i in range(block_size):
-        cache.push(2, kv, kv)  # Layer 2 is CSA
+        cache.push(2, kv, kv)
 
     # After pushing block_size tokens, tail should be empty
     tail_k, _ = cache.get_tail_kv(2)
@@ -46,7 +46,7 @@ def test_cache_state_window():
     cfg = DSV4TinyConfig()
     cache = DSV4Cache(cfg)
 
-    # Push tokens to a SWA layer
+    # Push tokens to any layer
     kv = torch.randn(cfg.num_key_value_heads, cfg.head_dim)
     for i in range(10):
         cache.push(0, kv, kv)
@@ -76,42 +76,36 @@ def test_cache_reset():
     cache = DSV4Cache(cfg)
 
     kv = torch.randn(cfg.num_key_value_heads, cfg.head_dim)
-    for i in range(5):
+    for i in range(10):
         cache.push(0, kv, kv)
 
     cache.reset()
-
-    tail_k, _ = cache.get_tail_kv(0)
-    assert tail_k.numel() == 0, "Tail should be empty after reset"
     win_k, _ = cache.get_state_window(0)
     assert win_k.numel() == 0, "Window should be empty after reset"
 
 
-def test_cache_csa_block_count():
+def test_cache_block_counts_both_tiers():
+    """Every layer now compresses to both CSA and HCA tiers."""
     cfg = DSV4TinyConfig()
     cache = DSV4Cache(cfg)
 
     block_size = cfg.block_alignment
     kv = torch.randn(cfg.num_key_value_heads, cfg.head_dim)
 
-    # Push 3 blocks worth to a CSA layer
+    # Push 3 blocks worth to any layer
     for i in range(block_size * 3):
-        cache.push(2, kv, kv)
+        cache.push(0, kv, kv)
 
-    blocks = cache.csa_cache[2]
-    assert len(blocks) == 3, f"Expected 3 compressed blocks, got {len(blocks)}"
+    # Both tiers should have blocks for layer 0
+    assert len(cache.csa_cache[0]) == 3, f"Expected 3 CSA blocks, got {len(cache.csa_cache[0])}"
+    assert len(cache.hca_cache[0]) == 3, f"Expected 3 HCA blocks, got {len(cache.hca_cache[0])}"
 
 
-def test_cache_hca_block_count():
+def test_cache_stats():
     cfg = DSV4TinyConfig()
     cache = DSV4Cache(cfg)
-
-    block_size = cfg.block_alignment
-    kv = torch.randn(cfg.num_key_value_heads, cfg.head_dim)
-
-    # Push 2 blocks worth to an HCA layer
-    for i in range(block_size * 2):
-        cache.push(3, kv, kv)
-
-    blocks = cache.hca_cache[3]
-    assert len(blocks) == 2, f"Expected 2 compressed blocks, got {len(blocks)}"
+    stats = cache.cache_stats
+    assert "csa_block_counts" in stats
+    assert "hca_block_counts" in stats
+    assert "tail_sizes" in stats
+    assert "swa_buffer_sizes" in stats

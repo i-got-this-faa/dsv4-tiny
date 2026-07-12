@@ -1,0 +1,15 @@
+# DSV4-Tiny training preset: A100 40GB (Google Colab Pro/Pro+)
+# Full-length sequences, full fine-tuning possible
+# Use: !python scripts/finetune_lora.py --from-config a100-colab --checkpoint ...
+
+[train]
+seq_len = 512
+batch_size = 4
+grad_accum = 4
+max_steps = 4000
+warmup_steps = 400
+lr = 3e-4
+log_interval = 10
+save_interval = 500
+cpu_offload_lm_head = false
+use_grad_checkpoint = true

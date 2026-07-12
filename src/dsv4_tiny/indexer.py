@@ -23,15 +23,18 @@ class LightningIndexer(nn.Module):
     in the cache and returns indices of the top-k blocks.
     """
 
-    def __init__(self, config: DSV4TinyConfig):
+    def __init__(self, config: DSV4TinyConfig, shared_W_DQ: Optional[nn.Linear] = None):
         super().__init__()
         d = config.hidden_size             # 1024
         n_Ih = config.indexer_heads        # 8
         c_I = config.indexer_dim           # 128
         self.top_k = config.indexer_top_k  # 128
 
-        # W_DQ: (d, c_I * n_Ih) — decomposed query projection
-        self.W_DQ = nn.Linear(d, c_I * n_Ih, bias=False)
+        # W_DQ: (d, c_I * n_Ih) — decomposed query projection (shared or per-module)
+        if shared_W_DQ is not None:
+            self.W_DQ = shared_W_DQ
+        else:
+            self.W_DQ = nn.Linear(d, c_I * n_Ih, bias=False)
 
         # W_IUQ: (c_I, c_I) — indexer query up-projection per head
         self.W_IUQ = nn.Linear(c_I, c_I, bias=False)

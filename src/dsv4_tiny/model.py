@@ -63,11 +63,11 @@ class MLP(nn.Module):
 class DecoderLayer(nn.Module):
     """Single decoder layer: norm → attention → residual → norm → MLP → residual."""
 
-    def __init__(self, config: DSV4TinyConfig, layer_idx: int):
+    def __init__(self, config: DSV4TinyConfig, layer_idx: int, shared_W_DQ: Optional[nn.Linear] = None):
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = DSV4Attention(config, layer_idx)
+        self.self_attn = DSV4Attention(config, layer_idx, shared_W_DQ=shared_W_DQ)
         self.mlp = MLP(config)
 
     def forward(
@@ -101,9 +101,17 @@ class DSV4TinyForCausalLM(nn.Module):
         # ── Embedding ──
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
+        # ── Shared decomposed query projection ──
+        if config.shared_W_DQ:
+            c_I = config.indexer_dim
+            n_Ih = config.indexer_heads
+            self.W_DQ = nn.Linear(config.hidden_size, c_I * n_Ih, bias=False)
+        else:
+            self.W_DQ = None
+
         # ── Decoder layers ──
         self.layers = nn.ModuleList([
-            DecoderLayer(config, i) for i in range(config.num_hidden_layers)
+            DecoderLayer(config, i, shared_W_DQ=self.W_DQ) for i in range(config.num_hidden_layers)
         ])
 
         # ── Final norm ──
@@ -117,7 +125,7 @@ class DSV4TinyForCausalLM(nn.Module):
             self.lm_head.weight = self.embed_tokens.weight
 
         # ── KV Cache ──
-        self.cache = DSV4Cache(config)
+        self.cache = DSV4Cache(config, shared_W_DQ=self.W_DQ)
 
         # ── Initialize weights ──
         self._init_weights()
@@ -210,11 +218,11 @@ class DSV4TinyForCausalLM(nn.Module):
             k_key = f"{prefix}.self_attn.k_proj.weight"
             v_key = f"{prefix}.self_attn.v_proj.weight"
 
-            if hasattr(attn, "k_proj"):
-                if k_key in state:
-                    attn.k_proj.weight.data.copy_(state[k_key].to(dtype=dtype))
-                if v_key in state:
-                    attn.v_proj.weight.data.copy_(state[v_key].to(dtype=dtype))
+            # K/V projections (every layer now has k_proj/v_proj)
+            if k_key in state:
+                attn.k_proj.weight.data.copy_(state[k_key].to(dtype=dtype))
+            if v_key in state:
+                attn.v_proj.weight.data.copy_(state[v_key].to(dtype=dtype))
 
             # O projection
             o_key = f"{prefix}.self_attn.o_proj.weight"
@@ -331,9 +339,10 @@ class DSV4TinyForCausalLM(nn.Module):
                 result["loss"] = loss
             if use_cache:
                 result["cache_stats"] = self.cache.cache_stats
+                recon_loss = self.cache.reconstruction_loss
+                if recon_loss is not None:
+                    result["recon_loss"] = recon_loss
             return result
-
-        return (logits, loss) if loss is not None else (logits,)
 
     @torch.no_grad()
     def generate(

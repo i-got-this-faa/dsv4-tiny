@@ -1,14 +1,12 @@
-"""Utility helpers for DSV4-Tiny: RoPE, block alignment, precision."""
+"""Utility functions for DSV4-Tiny."""
 
 from __future__ import annotations
-
-import math
+from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-
 
 
 def rms_norm(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tensor:
@@ -188,3 +186,38 @@ def count_parameters(model: torch.nn.Module, trainable_only: bool = False) -> in
     if trainable_only:
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
     return sum(p.numel() for p in model.parameters())
+
+
+_CONFIG_CACHE: dict[str, dict] = {}
+
+
+def load_training_config(name: str, config_dir: str = "configs") -> dict:
+    """Load a training preset TOML from the configs/ directory.
+
+    Args:
+        name: Preset name (e.g. "rtx4050", "t4-colab") — with or without .toml suffix.
+        config_dir: Directory containing TOML presets.
+
+    Returns:
+        Dict of training hyperparameters under the "train" key.
+    """
+    import tomllib
+
+    if name in _CONFIG_CACHE:
+        return _CONFIG_CACHE[name]
+
+    path = Path(config_dir) / (name if name.endswith(".toml") else f"{name}.toml")
+    if not path.exists():
+        available = list(Path(config_dir).glob("*.toml"))
+        names = sorted(p.stem for p in available)
+        raise FileNotFoundError(
+            f"Config '{name}' not found in {config_dir}/.\n"
+            f"Available: {', '.join(names) or '(none)'}"
+        )
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    train_cfg = data.get("train", {})
+    _CONFIG_CACHE[name] = train_cfg
+    return train_cfg
