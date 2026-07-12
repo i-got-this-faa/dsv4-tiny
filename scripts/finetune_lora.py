@@ -52,18 +52,34 @@ def add_lora_to_model(
     alpha: int = 16,
     dropout: float = 0.0,
 ) -> None:
-    """Add LoRA adapters to Q/K/V/O projections in attention layers."""
+    """Add LoRA adapters to Q/K/V/O projections in attention layers.
+
+    Patches each Linear's forward to add the LoRA output on top of the frozen weight.
+    """
     lora_modules = {}
     for name, module in model.named_modules():
-        if any(k in name for k in ["q_proj", "k_proj", "v_proj", "o_proj"]):
-            if isinstance(module, nn.Linear) and module.weight.requires_grad is False:
-                # Store LoRA adapter on the module
-                lora = LoRALayer(
-                    module.in_features, module.out_features,
-                    r=r, alpha=alpha, dropout=dropout,
-                )
-                module.lora = lora
-                lora_modules[name] = lora
+        if not isinstance(module, nn.Linear):
+            continue
+        if not any(k in name for k in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+            continue
+        if module.weight.requires_grad:
+            # Already trainable — no LoRA needed
+            continue
+
+        # Store LoRA adapter
+        lora = LoRALayer(
+            module.in_features, module.out_features,
+            r=r, alpha=alpha, dropout=dropout,
+        ).to(module.weight.device, dtype=module.weight.dtype)
+
+        module.lora = lora
+
+        # Patch forward to include LoRA output
+        orig_fwd = module.forward
+        def patched(x, _orig=orig_fwd, _lora=lora):
+            return _orig(x) + _lora(x)
+        module.forward = patched
+        lora_modules[name] = lora
 
     print(f"Added LoRA adapters to {len(lora_modules)} linear layers")
     return lora_modules
@@ -119,20 +135,25 @@ def main():
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=500)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--cpu_offload_lm_head", action="store_true", default=True,
-                        help="Offload LM head to CPU during forward to save GPU memory")
+    parser.add_argument(
+        "--cpu_offload_lm_head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Offload LM head to CPU during forward to save GPU memory",
+    )
     args = parser.parse_args()
 
-    # Load preset if --from-config is given (overrides defaults above)
+    # Load preset if --from-config is given; CLI flags stay default unless unset
     if args.from_config:
         from dsv4_tiny.utils import load_training_config
         preset = load_training_config(args.from_config)
         for key, val in preset.items():
-            if hasattr(args, key):
-                setattr(args, key, val)
+            mapped = {"use_grad_checkpoint": "grad_checkpoint"}.get(key, key)
+            # Only apply preset if the user didn't explicitly pass the CLI flag
+            if hasattr(args, mapped) and getattr(args, mapped) == parser.get_default(mapped):
+                setattr(args, mapped, val)
                 print(f"  [config] {key} = {val}")
             # ignore unknown keys silently
-
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
 

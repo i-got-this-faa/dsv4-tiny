@@ -121,29 +121,28 @@ def main():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
         "--cpu_offload_lm_head",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Offload LM head to CPU during forward to save GPU memory",
     )
     parser.add_argument(
         "--grad_checkpoint",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=False,
         help="Gradient checkpointing per decoder layer.",
     )
     args = parser.parse_args()
 
-    # Load preset if --from-config is given (overrides defaults above)
+    # Load preset if --from-config is given; CLI flags stay default unless unset
     if args.from_config:
         from dsv4_tiny.utils import load_training_config
-
         preset = load_training_config(args.from_config)
         for key, val in preset.items():
-            if hasattr(args, key):
-                setattr(args, key, val)
+            mapped = {"use_grad_checkpoint": "grad_checkpoint"}.get(key, key)
+            # Only apply preset if the user didn't explicitly pass the CLI flag
+            if hasattr(args, mapped) and getattr(args, mapped) == parser.get_default(mapped):
+                setattr(args, mapped, val)
                 print(f"  [config] {key} = {val}")
-            elif key in ("use_grad_checkpoint",):
-                setattr(args, "grad_checkpoint", val)
             # ignore unknown keys silently
 
     device = torch.device(

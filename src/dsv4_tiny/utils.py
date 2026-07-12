@@ -1,6 +1,7 @@
 """Utility functions for DSV4-Tiny."""
 
 from __future__ import annotations
+import math
 from pathlib import Path
 from typing import Optional
 
